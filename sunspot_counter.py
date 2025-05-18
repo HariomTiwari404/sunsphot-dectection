@@ -70,12 +70,35 @@ def calculate_sunspot_number(num_spots):
     
     return wolf_number
 
+def get_first_image_from_sample_dir():
+    """
+    Get the first image from the sample_images directory
+    """
+    sample_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_images")
+    if not os.path.exists(sample_dir):
+        return None
+    
+    for file in os.listdir(sample_dir):
+        file_path = os.path.join(sample_dir, file)
+        if os.path.isfile(file_path) and file.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+            return file_path
+    
+    return None
+
 def main():
     parser = argparse.ArgumentParser(description="Run Sunspot detection model on an image")
-    parser.add_argument("--image", type=str, help="Path to the image file", required=True)
+    parser.add_argument("--image", type=str, help="Path to the image file")
     parser.add_argument("--confidence", type=float, default=0.5, help="Confidence threshold (default: 0.5)")
     parser.add_argument("--overlap", type=float, default=0.5, help="Overlap threshold (default: 0.5)")
     args = parser.parse_args()
+    
+    # If no image is provided, use the first image from sample_images directory
+    if not args.image:
+        args.image = get_first_image_from_sample_dir()
+        if not args.image:
+            print("Error: No image provided and no images found in sample_images directory")
+            return
+        print(f"Using image from sample directory: {args.image}")
     
     print("Loading Roboflow model...")
     # Initialize Roboflow API
