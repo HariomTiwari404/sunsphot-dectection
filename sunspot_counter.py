@@ -4,8 +4,9 @@ import cv2
 import matplotlib.pyplot as plt
 import argparse
 import numpy as np
+from sklearn.cluster import DBSCAN
 
-def visualize_predictions(image, predictions):
+def visualize_predictions(image, predictions, sunspot_info=None):
     """
     Visualize the predictions on the image with rectangles around sunspots
     """
@@ -15,8 +16,24 @@ def visualize_predictions(image, predictions):
     # Sort predictions by position for consistent numbering
     predictions = sorted(predictions, key=lambda p: (p["y"], p["x"]))
     
+    # Extract coordinates for clustering if sunspot_info is not provided
+    if sunspot_info is None:
+        coordinates = np.array([[p['x'], p['y']] for p in predictions])
+        clustering = DBSCAN(eps=100, min_samples=1).fit(coordinates)
+        labels = clustering.labels_
+    else:
+        # Use provided coordinates and labels (if any)
+        coordinates = np.array([[p['x'], p['y']] for p in predictions])
+        clustering = DBSCAN(eps=100, min_samples=1).fit(coordinates)
+        labels = clustering.labels_
+    
+    # Assign colors to different groups
+    unique_labels = set(labels)
+    colors = plt.cm.rainbow(np.linspace(0, 1, len(unique_labels)))
+    label_to_color = {label: colors[i] for i, label in enumerate(unique_labels)}
+    
     # Draw rectangles and labels
-    for i, prediction in enumerate(predictions, 1):
+    for i, (prediction, label) in enumerate(zip(predictions, labels), 1):
         x = prediction["x"]
         y = prediction["y"]
         
@@ -30,8 +47,13 @@ def visualize_predictions(image, predictions):
         x2 = int(x + width/2)
         y2 = int(y + height/2)
         
+        # Get color for this group
+        color = label_to_color[label]
+        # Convert from 0-1 RGB to 0-255 BGR for OpenCV
+        box_color = (int(color[2]*255), int(color[1]*255), int(color[0]*255))
+        
         # Draw rectangle
-        cv2.rectangle(img_with_labels, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(img_with_labels, (x1, y1), (x2, y2), box_color, 2)
         
         # Add the number label
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -53,22 +75,44 @@ def visualize_predictions(image, predictions):
         cv2.putText(img_with_labels, text, (text_x, text_y), 
                    font, 0.7, (255, 0, 0), 2)
     
-    return img_with_labels
+    return img_with_labels, labels
 
-def calculate_sunspot_number(num_spots):
+def calculate_sunspot_number(predictions):
     """
     Calculate the International Sunspot Number (ISN) based on SILSO method.
-    Simple version - assumes each spot is its own group.
+    Uses DBSCAN clustering to identify sunspot groups.
     R = k(10g + s)
+    Where:
+    - k is the observer factor (1.0 for this implementation)
+    - g is the number of sunspot groups
+    - s is the total number of individual sunspots
     """
-    # For simplicity, consider each spot as its own group
-    groups = num_spots
+    # If no sunspots, return 0
+    if len(predictions) == 0:
+        return 0, 0, 0
+    
+    # Extract coordinates for clustering
+    coordinates = np.array([[p['x'], p['y']] for p in predictions])
+    
+    # Use DBSCAN to cluster sunspots into groups
+    # The eps parameter determines the maximum distance between two points to be considered in the same group
+    # This may need tuning based on typical image dimensions and sunspot distributions
+    clustering = DBSCAN(eps=100, min_samples=1).fit(coordinates)
+    
+    # Get the number of groups (number of unique cluster labels, excluding noise which is -1)
+    unique_labels = set(clustering.labels_)
+    if -1 in unique_labels:  # Remove noise label if present
+        unique_labels.remove(-1)
+    num_groups = len(unique_labels)
+    
+    # Count total spots
+    num_spots = len(predictions)
     
     # Wolf number calculation (k=1)
-    k = 1
-    wolf_number = k * (10 * groups + num_spots)
+    k = 1.0
+    wolf_number = k * (10 * num_groups + num_spots)
     
-    return wolf_number
+    return wolf_number, num_groups, num_spots
 
 def get_first_image_from_sample_dir():
     """
@@ -123,31 +167,27 @@ def main():
     # Run inference
     predictions = model.predict(args.image, confidence=args.confidence, overlap=args.overlap).json()
     
-    # Count spots
-    num_spots = len(predictions['predictions'])
-    sunspot_number = calculate_sunspot_number(num_spots)
+    # Count spots and calculate sunspot number
+    sunspot_num, num_groups, num_spots = calculate_sunspot_number(predictions['predictions'])
     
-    # Print results - just the number, not the full details
-    print(f"Found {num_spots} sunspots")
-    
-    # Print raw predictions for debugging
-    for i, pred in enumerate(predictions['predictions']):
-        print(f"Spot {i+1}: x={pred['x']}, y={pred['y']}, width={pred.get('width', 'N/A')}, height={pred.get('height', 'N/A')}")
+    # Print results
+    print(f"Found {num_spots} sunspots in {num_groups} groups")
+    print(f"Calculated sunspot number: {sunspot_num:.1f}")
     
     # Visualize the results
     image = cv2.imread(args.image)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB for display
     
-    img_with_labels = visualize_predictions(image, predictions['predictions'])
+    img_with_labels, labels = visualize_predictions(image, predictions['predictions'])
     
-    # Display the image with predictions - show entire solar disk
+    # Display the image with predictions
     plt.figure(figsize=(12, 12))
     plt.imshow(img_with_labels)
     plt.axis('off')
-    plt.title(f"Sunspot Count: {num_spots}", fontsize=14)
+    plt.title(f"Sunspot Number: {sunspot_num:.1f} ({num_groups} groups, {num_spots} spots)", fontsize=14)
     plt.tight_layout()
     
-    # Show the image (no saving)
+    # Show the image
     plt.show()
 
 if __name__ == "__main__":
