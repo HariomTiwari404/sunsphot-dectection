@@ -157,10 +157,72 @@ def refine_groups_by_physics(predictions, labels, disk_center, disk_radius):
     
     return new_labels
 
-def calculate_sunspot_number(predictions, image_shape):
+def detect_spots_in_region(image, x, y, width, height, padding=10):
+    """
+    Detect individual sunspots within a region identified by Roboflow.
+    Uses local thresholding and contour detection to identify dark spots.
+    
+    Args:
+        image: The full solar image
+        x, y: Center coordinates of the region
+        width, height: Dimensions of the region
+        padding: Extra padding around the region to ensure we capture the full spot
+        
+    Returns:
+        count: Number of individual spots detected in the region
+        spot_centers: List of (x,y) coordinates for each detected spot
+    """
+    # Calculate region boundaries with padding
+    x1 = max(0, int(x - width/2 - padding))
+    y1 = max(0, int(y - height/2 - padding))
+    x2 = min(image.shape[1], int(x + width/2 + padding))
+    y2 = min(image.shape[0], int(y + height/2 + padding))
+    
+    # Extract the region
+    region = image[y1:y2, x1:x2]
+    
+    # Convert to grayscale if needed
+    if len(region.shape) == 3:
+        region_gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+    else:
+        region_gray = region
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(region_gray, (5, 5), 0)
+    
+    # Apply adaptive thresholding to highlight dark spots
+    # We invert the thresholding since sunspots are darker than surroundings
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # Apply morphological operations to clean up the binary image
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    # Find contours in the binary image
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours by size to remove noise
+    min_area = 5  # Minimum area in pixels for a valid sunspot
+    valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+    
+    # Get the center coordinates of each valid contour
+    spot_centers = []
+    for contour in valid_contours:
+        M = cv2.moments(contour)
+        if M["m00"] > 0:
+            # Adjust coordinates to be relative to the original image
+            cx = int(M["m10"] / M["m00"]) + x1
+            cy = int(M["m01"] / M["m00"]) + y1
+            spot_centers.append((cx, cy))
+    
+    return len(valid_contours), spot_centers
+
+def calculate_sunspot_number(predictions, image_shape, original_image=None):
     """
     Calculate the International Sunspot Number (ISN) based on SILSO method.
     Uses DBSCAN clustering to identify sunspot groups.
+    Then counts individual spots within each region if the original image is provided.
     R = k(10g + s)
     Where:
     - k is the observer factor (1.0 for this implementation)
@@ -186,8 +248,24 @@ def calculate_sunspot_number(predictions, image_shape):
         unique_labels.remove(-1)
     num_groups = len(unique_labels)
     
-    # Count total spots
-    num_spots = len(predictions)
+    # If original image is provided, detect individual spots within each region
+    total_spots = 0
+    all_spot_centers = []
+    
+    if original_image is not None:
+        for prediction in predictions:
+            x = prediction["x"]
+            y = prediction["y"]
+            width = prediction.get("width", 20)
+            height = prediction.get("height", 20)
+            
+            # Detect spots in this region
+            spot_count, spot_centers = detect_spots_in_region(original_image, x, y, width, height)
+            total_spots += spot_count
+            all_spot_centers.extend(spot_centers)
+    else:
+        # Fallback to counting regions as spots
+        total_spots = len(predictions)
     
     # Calculate spots per group for analysis
     spots_per_group = {}
@@ -197,14 +275,14 @@ def calculate_sunspot_number(predictions, image_shape):
     
     # Wolf number calculation (k=1)
     k = 1.0
-    wolf_number = k * (10 * num_groups + num_spots)
+    wolf_number = k * (10 * num_groups + total_spots)
     
-    return wolf_number, num_groups, num_spots, refined_labels
+    return wolf_number, num_groups, total_spots, refined_labels, all_spot_centers if original_image is not None else None
 
-def visualize_predictions(image, predictions, labels=None):
+def visualize_predictions(image, predictions, labels=None, spot_centers=None):
     """
     Visualize the predictions on the image with rectangles around sunspots
-    Color-coded by group
+    Color-coded by group. Also shows individual spot centers if provided.
     """
     # Make a copy of the image to draw on
     img_with_labels = image.copy()
@@ -260,7 +338,7 @@ def visualize_predictions(image, predictions, labels=None):
             hull_color = (int(color[2]*200), int(color[1]*200), int(color[0]*200))
             cv2.drawContours(img_with_labels, [hull], 0, hull_color, 2)
     
-    # Draw rectangles and labels for each spot
+    # Draw rectangles and labels for each region
     for idx, (orig_idx, prediction) in enumerate(sorted_with_indices, 1):
         x = prediction["x"]
         y = prediction["y"]
@@ -319,6 +397,12 @@ def visualize_predictions(image, predictions, labels=None):
         
         cv2.putText(img_with_labels, coord_text, (coord_x, coord_y), 
                    font, 0.5, (0, 0, 0), 1)
+    
+    # Draw individual spots if centers are provided
+    if spot_centers:
+        for cx, cy in spot_centers:
+            # Draw a small circle at each spot center
+            cv2.circle(img_with_labels, (cx, cy), 3, (255, 50, 50), -1)
     
     return img_with_labels
 
@@ -402,7 +486,9 @@ def main():
     predictions = model.predict(args.image, confidence=args.confidence, overlap=args.overlap).json()
     
     # Count spots and calculate sunspot number
-    sunspot_num, num_groups, num_spots, labels = calculate_sunspot_number(predictions['predictions'], image.shape)
+    sunspot_num, num_groups, num_spots, labels, spot_centers = calculate_sunspot_number(
+        predictions['predictions'], image.shape, original_image=image
+    )
     
     # Print results
     print(f"Found {num_spots} sunspots in {num_groups} groups")
@@ -417,10 +503,10 @@ def main():
         
         print("Group distribution:")
         for group_id, count in spots_per_group.items():
-            print(f"  Group {group_id+1}: {count} spots")
+            print(f"  Group {group_id+1}: {count} regions")
     
     # Visualize the results
-    img_with_labels = visualize_predictions(image, predictions['predictions'], labels)
+    img_with_labels = visualize_predictions(image, predictions['predictions'], labels, spot_centers)
     
     # Display the image with predictions
     plt.figure(figsize=(12, 12))
